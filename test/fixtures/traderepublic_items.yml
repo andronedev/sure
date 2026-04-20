@@ -1,0 +1,2 @@
+# Empty fixture to ensure the traderepublic_items table is truncated during tests.
+# Tests create TraderepublicItem records explicitly in setup.

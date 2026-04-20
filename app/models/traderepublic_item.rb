@@ -1,10 +1,8 @@
-
 class TraderepublicItem < ApplicationRecord
-  include Syncable, Provided
+  include Syncable
 
   enum :status, { good: "good", requires_update: "requires_update" }, default: :good, prefix: true
 
-  # Helper to detect if ActiveRecord Encryption is configured for this app
   def self.encryption_ready?
     creds_ready = Rails.application.credentials.active_record_encryption.present?
     env_ready = ENV["ACTIVE_RECORD_ENCRYPTION_PRIMARY_KEY"].present? &&
@@ -13,12 +11,11 @@ class TraderepublicItem < ApplicationRecord
     creds_ready || env_ready
   end
 
-  # Encrypt sensitive credentials if ActiveRecord encryption is configured
   if encryption_ready?
     encrypts :phone_number, deterministic: true
     encrypts :pin, deterministic: true
-    encrypts :session_token # non-deterministic (default)
-    encrypts :refresh_token # non-deterministic (default)
+    encrypts :session_token
+    encrypts :refresh_token
   end
 
   validates :name, presence: true
@@ -44,23 +41,18 @@ class TraderepublicItem < ApplicationRecord
   def import_latest_traderepublic_data(skip_token_refresh: false, sync: nil)
     provider = traderepublic_provider
     unless provider
-      Rails.logger.error "TraderepublicItem #{id} - Cannot import: TradeRepublic provider is not configured (missing credentials)"
+      Rails.logger.error "TraderepublicItem #{id} - Cannot import: provider not configured (no session or credentials)"
       raise StandardError.new(I18n.t("traderepublic_items.errors.provider_not_configured", default: "TradeRepublic provider is not configured"))
     end
 
-    # Try import with current tokens
     TraderepublicItem::Importer.new(self, traderepublic_provider: provider).import
   rescue TraderepublicError => e
-    # If authentication failed and we have credentials, try re-authenticating automatically
     if [ :unauthorized, :auth_failed ].include?(e.error_code) && !skip_token_refresh && credentials_configured?
       Rails.logger.warn "TraderepublicItem #{id} - Authentication failed, attempting automatic re-authentication"
 
       if auto_reauthenticate
-        Rails.logger.info "TraderepublicItem #{id} - Re-authentication successful, retrying import"
-        # Retry import with fresh tokens (skip_token_refresh to avoid infinite loop)
         import_latest_traderepublic_data(skip_token_refresh: true)
       else
-        Rails.logger.error "TraderepublicItem #{id} - Automatic re-authentication failed"
         update!(status: :requires_update)
         raise StandardError.new("Session expired and automatic re-authentication failed. Please log in again manually.")
       end
@@ -82,18 +74,17 @@ class TraderepublicItem < ApplicationRecord
   end
 
   def traderepublic_provider
-    return nil unless credentials_configured?
+    return nil unless session_configured? || credentials_configured?
 
-    @traderepublic_provider ||= Provider::Traderepublic.new(
+    Provider::Traderepublic.new(
       phone_number: phone_number,
       pin: pin,
       session_token: session_token,
       refresh_token: refresh_token,
-      raw_cookies: session_cookies
+      raw_cookies: stored_raw_cookies
     )
   end
 
-  # Initiate login and store processId
   def initiate_login!
     provider = Provider::Traderepublic.new(
       phone_number: phone_number,
@@ -103,30 +94,32 @@ class TraderepublicItem < ApplicationRecord
     result = provider.initiate_login
     update!(
       process_id: result["processId"],
-      session_cookies: { jsessionid: provider.jsessionid }.compact
+      session_cookies: [ provider.jsessionid ].compact
     )
     result
   end
 
-  # Complete login with device PIN
   def complete_login!(device_pin)
     raise I18n.t("traderepublic_items.errors.no_process_id", default: "No processId found") unless process_id
 
     provider = Provider::Traderepublic.new(
       phone_number: phone_number,
-      pin: pin
+      pin: pin,
+      raw_cookies: stored_raw_cookies
     )
     provider.process_id = process_id
-    provider.jsessionid = session_cookies&.dig("jsessionid") if session_cookies.is_a?(Hash)
+    provider.jsessionid = stored_raw_cookies.find { |c| c.to_s.start_with?("JSESSIONID=") }
 
     provider.verify_device_pin(device_pin)
 
-    # Save session data
+    # Session tokens obtained — clear the PIN: TR requires SMS for any future
+    # re-auth, so keeping the PIN provides no automation benefit, only risk.
     update!(
       session_token: provider.session_token,
       refresh_token: provider.refresh_token,
       session_cookies: provider.raw_cookies,
-      process_id: nil, # Clear processId after successful login
+      process_id: nil,
+      pin: nil,
       status: :good
     )
 
@@ -137,45 +130,28 @@ class TraderepublicItem < ApplicationRecord
     false
   end
 
-  # Check if login needs to be completed
   def pending_login?
     process_id.present? && session_token.blank?
   end
 
-  # Automatic re-authentication when tokens expire
-  # Trade Republic doesn't support token refresh, so we need to re-authenticate from scratch
+  # Trade Republic does not support silent refresh — any re-auth requires SMS.
+  # This method can only initiate login; completion is driven by the user.
   def auto_reauthenticate
-    Rails.logger.info "TraderepublicItem #{id}: Starting automatic re-authentication"
+    return false unless credentials_configured?
 
-    unless credentials_configured?
-      Rails.logger.error "TraderepublicItem #{id}: Cannot auto re-authenticate - credentials not configured"
-      return false
-    end
-
-    begin
-      # Step 1: Initiate login to get processId
-      result = initiate_login!
-
-      Rails.logger.info "TraderepublicItem #{id}: Login initiated, processId: #{process_id}"
-
-      # Trade Republic requires SMS verification - we can't auto-complete this step
-      # Mark as requires_update so user knows they need to re-authenticate
-      Rails.logger.warn "TraderepublicItem #{id}: SMS verification required - automatic re-authentication cannot proceed"
-      update!(status: :requires_update)
-
-      false
-    rescue => e
-      Rails.logger.error "TraderepublicItem #{id}: Automatic re-authentication failed - #{e.message}"
-      false
-    end
+    initiate_login!
+    update!(status: :requires_update)
+    false
+  rescue => e
+    Rails.logger.error "TraderepublicItem #{id}: Automatic re-authentication failed - #{e.message}"
+    false
   end
 
   def syncer
-    @syncer ||= TraderepublicItem::Syncer.new(self)
+    TraderepublicItem::Syncer.new(self)
   end
 
   def process_accounts
-    # Process each account's transactions and create entries
     traderepublic_accounts.includes(:linked_account).each do |tr_account|
       next unless tr_account.linked_account
 
@@ -184,7 +160,6 @@ class TraderepublicItem < ApplicationRecord
   end
 
   def schedule_account_syncs(parent_sync:, window_start_date: nil, window_end_date: nil)
-    # Trigger balance calculations for linked accounts
     traderepublic_accounts.joins(:account).merge(Account.visible).each do |tr_account|
       tr_account.linked_account.sync_later(
         parent_sync: parent_sync,
@@ -194,44 +169,13 @@ class TraderepublicItem < ApplicationRecord
     end
   end
 
-  # Enqueue a sync for this item
-  def sync_later(parent_sync: nil, window_start_date: nil, window_end_date: nil)
-    sync = Sync.create!(
-      syncable: self,
-      parent: parent_sync,
-      window_start_date: window_start_date,
-      window_end_date: window_end_date
-    )
-    TraderepublicItem::SyncJob.perform_later(sync)
-    sync
-  end
+  private
 
-  # Perform sync using the Sync pattern
-  def perform_sync(sync)
-    sync.start! if sync.may_start?
-    begin
-      provider = traderepublic_provider
-      unless provider
-        sync.fail!
-        sync.update(error: I18n.t("traderepublic_items.errors.provider_not_configured", default: "TradeRepublic provider is not configured"))
-        return false
+    def stored_raw_cookies
+      case session_cookies
+      when Array then session_cookies
+      when Hash then session_cookies.values.compact
+      else []
       end
-      importer = TraderepublicItem::Importer.new(self, traderepublic_provider: provider)
-      success = importer.import
-      if success
-        sync.complete!
-        true
-      else
-        sync.fail!
-        sync.update(error: "Import failed")
-        false
-      end
-    rescue => e
-      sync.fail!
-      sync.update(error: e.message)
-      Rails.logger.error "TraderepublicItem #{id} - perform_sync failed: #{e.class}: #{e.message}"
-      Rails.logger.error e.backtrace.join("\n")
-      false
     end
-  end
 end

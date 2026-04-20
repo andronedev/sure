@@ -16,16 +16,15 @@
             <label for="device_pin" class="block text-sm font-medium text-primary mb-2">
               <%= t(".pin_label", default: "Verification Code") %>
             </label>
-            <input 
-              type="text" 
-              id="device_pin" 
+            <input
+              type="text"
+              id="device_pin"
               name="device_pin"
               placeholder="<%= t(".pin_placeholder", default: "Enter 4-digit code") %>"
               maxlength="4"
               pattern="[0-9]{4}"
               autocomplete="off"
-              class="w-full px-4 py-3 border border-primary rounded-lg text-center text-2xl font-mono tracking-widest focus:outline-none focus:ring-2 focus:ring-accent"
-            />
+              class="w-full px-4 py-3 border border-primary rounded-lg text-center text-2xl font-mono tracking-widest focus:outline-none focus:ring-2 focus:ring-accent">
             <p id="error-message" class="text-xs text-error mt-2 hidden"></p>
           </div>
 
@@ -38,11 +37,10 @@
             <%= link_to t(".cancel", default: "Cancel"), traderepublic_items_path,
                 class: "inline-flex items-center gap-1 px-3 py-2 text-sm font-medium rounded-lg text-primary button-bg-secondary hover:button-bg-secondary-hover",
                 data: { turbo_frame: "_top", action: "DS--dialog#close" } %>
-            <button 
-              type="button" 
+            <button
+              type="button"
               id="verify-btn"
-              class="inline-flex items-center gap-1 px-3 py-2 text-sm font-medium rounded-lg text-inverse bg-inverse hover:bg-inverse-hover disabled:button-bg-disabled"
-            >
+              class="inline-flex items-center gap-1 px-3 py-2 text-sm font-medium rounded-lg text-inverse bg-inverse hover:bg-inverse-hover disabled:button-bg-disabled">
               <%= t(".verify", default: "Verify") %>
             </button>
           </div>
@@ -100,7 +98,7 @@
               device_pin: devicePin,
               accountable_type: '<%= params[:accountable_type] || "Investment" %>',
               return_to: '<%= @return_to %>',
-              manual_sync: <%= (local_assigns[:manual_sync] || params[:manual_sync]) ? 'true' : 'false' %>
+              manual_sync: <%= (local_assigns[:manual_sync] || params[:manual_sync]) ? "true" : "false" %>
             })
           });
 

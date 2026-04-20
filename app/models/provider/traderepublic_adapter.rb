@@ -43,14 +43,10 @@ class Provider::TraderepublicAdapter < Provider::Base
   def self.build_provider(family: nil)
     return nil unless family.present?
 
-    # Get family-specific credentials
     traderepublic_item = family.traderepublic_items.where.not(phone_number: nil).first
-    return nil unless traderepublic_item&.credentials_configured?
+    return nil unless traderepublic_item
 
-    Provider::Traderepublic.new(
-      phone_number: traderepublic_item.phone_number,
-      pin: traderepublic_item.pin
-    )
+    traderepublic_item.traderepublic_provider
   end
 
   def sync_path

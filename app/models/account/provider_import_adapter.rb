@@ -551,24 +551,18 @@ class Account::ProviderImportAdapter
   # @param external_id [String, nil] Provider's unique ID (optional, for deduplication)
   # @param source [String] Provider name
   # @param activity_label [String, nil] Investment activity label (e.g., "Buy", "Sell", "Reinvestment")
-  # @param trade_type [String, nil] Optional trade type override for TradeRepublic naming
+  # @param trade_type [String, nil] Optional "buy"/"sell" override used when the provider
+  #   reports trade direction explicitly (e.g. short sells where qty sign alone is ambiguous).
   # @return [Entry] The created entry with trade
   def import_trade(security:, quantity:, price:, amount:, currency:, date:, name: nil, external_id: nil, source:, activity_label: nil, trade_type: nil)
     raise ArgumentError, "security is required" if security.nil?
     raise ArgumentError, "source is required" if source.blank?
 
     Account.transaction do
-      # Generate name if not provided
       trade_name = if name.present?
         name
       else
-        # Only use trade_type if source is traderepublic and trade_type is present
-        effective_type =
-          if source == "traderepublic" && trade_type.present?
-            trade_type
-          else
-            quantity.negative? ? "sell" : "buy"
-          end
+        effective_type = trade_type.presence || (quantity.negative? ? "sell" : "buy")
         Trade.build_name(effective_type, quantity, security.ticker)
       end
 

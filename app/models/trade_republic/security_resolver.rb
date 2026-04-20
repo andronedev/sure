@@ -1,39 +1,40 @@
-
-# Centralizes logic for resolving, associating, or creating a Security for TradeRepublic
 class TradeRepublic::SecurityResolver
   def initialize(isin, name: nil, ticker: nil, mic: nil)
-    @isin = isin&.strip&.upcase
+    @isin = isin&.strip&.upcase.presence
     @name = name
-    @ticker = ticker
-    @mic = mic
+    @ticker = ticker&.strip.presence
+    @mic = mic&.strip.presence
   end
 
-  # Returns the existing Security or creates a new one if not found
   def resolve
-    Rails.logger.info "TradeRepublic::SecurityResolver - Resolve called: ISIN=#{@isin.inspect}, name=#{@name.inspect}, ticker=#{@ticker.inspect}, mic=#{@mic.inspect}"
-    return nil unless @isin.present?
+    return nil unless @isin
 
-    # Search for an exact ISIN match in the name
-    security = Security.where("name LIKE ?", "%#{@isin}%").first
-    if security
-      Rails.logger.info "TradeRepublic::SecurityResolver - Security found by ISIN in name: id=#{security.id}, ISIN=#{@isin}, name=#{security.name.inspect}, ticker=#{security.ticker.inspect}, mic=#{security.exchange_operating_mic.inspect}"
-      return security
-    end
-
-    # Create a new Security if none found
-    name = @name.present? ? @name : "Security #{@isin}"
-    name = "#{name} (#{@isin})" unless name.include?(@isin)
-    begin
-      security = Security.create!(name: name, ticker: @ticker, exchange_operating_mic: @mic)
-      Rails.logger.info "TradeRepublic::SecurityResolver - Security created: id=#{security.id}, ISIN=#{@isin}, ticker=#{@ticker}, mic=#{@mic}, name=#{name.inspect}"
-      security
-    rescue ActiveRecord::RecordInvalid => e
-      if e.message.include?("Ticker has already been taken")
-        existing = Security.where(ticker: @ticker, exchange_operating_mic: @mic).first
-        Rails.logger.warn "TradeRepublic::SecurityResolver - Duplicate ticker/mic, returning existing: id=#{existing&.id}, ticker=#{@ticker}, mic=#{@mic}"
-        return existing if existing
-      end
-      raise
-    end
+    find_by_ticker_and_mic || find_by_isin_in_name || create_new
   end
+
+  private
+
+    def find_by_ticker_and_mic
+      return nil unless @ticker
+
+      Security.where("UPPER(ticker) = ?", @ticker.upcase)
+              .where("UPPER(COALESCE(exchange_operating_mic, '')) = ?", (@mic || "").upcase)
+              .first
+    end
+
+    def find_by_isin_in_name
+      pattern = "%#{ActiveRecord::Base.sanitize_sql_like(@isin)}%"
+      Security.where("name LIKE ?", pattern).first
+    end
+
+    def create_new
+      display_name = @name.present? ? @name : "Security #{@isin}"
+      display_name = "#{display_name} (#{@isin})" unless display_name.include?(@isin)
+
+      Security.create!(name: display_name, ticker: @ticker, exchange_operating_mic: @mic)
+    rescue ActiveRecord::RecordInvalid => e
+      raise unless e.message.include?("Ticker has already been taken") && @ticker
+
+      find_by_ticker_and_mic
+    end
 end

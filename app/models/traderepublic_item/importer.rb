@@ -1,17 +1,7 @@
-
 class TraderepublicItem::Importer
   include TraderepublicSessionConfigurable
+
   attr_reader :traderepublic_item, :provider
-
-  # Utility to find or create a security by ISIN, otherwise by ticker/MIC
-  def find_or_create_security_from_tr(position_or_txn)
-    isin = position_or_txn["isin"]&.strip&.upcase.presence
-    ticker = position_or_txn["ticker"]&.strip.presence || position_or_txn["symbol"]&.strip.presence
-    mic = position_or_txn["exchange_operating_mic"]&.strip.presence || position_or_txn["mic"]&.strip.presence
-    name = position_or_txn["name"]&.strip.presence
-
-    TradeRepublic::SecurityResolver.new(isin, name: name, ticker: ticker, mic: mic).resolve
-  end
 
   def initialize(traderepublic_item, traderepublic_provider: nil)
     @traderepublic_item = traderepublic_item
@@ -24,62 +14,48 @@ class TraderepublicItem::Importer
 
     Rails.logger.info "TraderepublicItem #{traderepublic_item.id}: Starting import"
 
-    # Import portfolio and create/update accounts
     import_portfolio
-
-    # Import timeline transactions
     import_transactions
 
-    # Mark sync as successful
     traderepublic_item.update!(status: :good)
 
-    Rails.logger.info "TraderepublicItem #{traderepublic_item.id}: Import completed successfully"
-
+    Rails.logger.info "TraderepublicItem #{traderepublic_item.id}: Import completed"
     true
   rescue TraderepublicError => e
     Rails.logger.error "TraderepublicItem #{traderepublic_item.id}: Import failed - #{e.message}"
 
-    # Mark as requires_update if authentication error
     if [ :unauthorized, :auth_failed ].include?(e.error_code)
       traderepublic_item.update!(status: :requires_update)
-      raise e # Re-raise so the caller can handle re-auth
+      raise
     end
 
     false
   rescue => e
     Rails.logger.error "TraderepublicItem #{traderepublic_item.id}: Import failed - #{e.class}: #{e.message}"
-    Rails.logger.error e.backtrace.join("\n")
     false
   end
 
   private
 
+    def find_or_create_security_from_tr(position_or_txn)
+      isin = position_or_txn["isin"]&.strip&.upcase.presence
+      ticker = position_or_txn["ticker"]&.strip.presence || position_or_txn["symbol"]&.strip.presence
+      mic = position_or_txn["exchange_operating_mic"]&.strip.presence || position_or_txn["mic"]&.strip.presence
+      name = position_or_txn["name"]&.strip.presence
+
+      TradeRepublic::SecurityResolver.new(isin, name: name, ticker: ticker, mic: mic).resolve
+    end
+
     def import_portfolio
       Rails.logger.info "TraderepublicItem #{traderepublic_item.id}: Fetching portfolio data"
 
-      portfolio_data = provider.get_portfolio
-      cash_data = provider.get_cash
+      batch = provider.get_portfolio_and_cash_batch
+      portfolio_data = normalize_json(batch[:portfolio]) || {}
+      cash_data = normalize_json(batch[:cash])
 
-      parsed_portfolio = if portfolio_data
-        portfolio_data.is_a?(String) ? JSON.parse(portfolio_data) : portfolio_data
-      else
-        {}
-      end
-
-      parsed_cash = if cash_data
-        cash_data.is_a?(String) ? JSON.parse(cash_data) : cash_data
-      else
-        nil
-      end
-
-      # Get or create main account
-      account = find_or_create_main_account(parsed_portfolio)
-
-      # Update account with portfolio data
-      update_account_with_portfolio(account, parsed_portfolio, parsed_cash)
-
-      # Import holdings/positions
-      import_holdings(account, parsed_portfolio)
+      account = find_or_create_main_account(portfolio_data)
+      update_account_with_portfolio(account, portfolio_data, cash_data)
+      import_holdings(account, portfolio_data)
     rescue JSON::ParserError => e
       Rails.logger.error "TraderepublicItem #{traderepublic_item.id}: Failed to parse portfolio data - #{e.message}"
     end
@@ -93,73 +69,74 @@ class TraderepublicItem::Importer
       since_date = account.last_transaction_date
       if account.linked_account.nil? || !account.linked_account.transactions.exists?
         since_date = nil
-        Rails.logger.info "TraderepublicItem #{traderepublic_item.id}: Forcing initial full sync (no transactions exist)"
-      elsif since_date
-        Rails.logger.info "TraderepublicItem #{traderepublic_item.id}: Incremental sync from #{since_date}"
-      else
-        Rails.logger.info "TraderepublicItem #{traderepublic_item.id}: Initial full sync"
       end
 
       transactions_data = provider.get_timeline_transactions(since: since_date)
-      Rails.logger.info "TraderepublicItem #{traderepublic_item.id}: transactions_data class=#{transactions_data.class} keys=#{transactions_data.respond_to?(:keys) ? transactions_data.keys : "n/a"}"
-      Rails.logger.info "TraderepublicItem #{traderepublic_item.id}: transactions_data preview=#{transactions_data.inspect[0..300]}"
       return unless transactions_data
 
-      parsed = transactions_data.is_a?(String) ? JSON.parse(transactions_data) : transactions_data
-      Rails.logger.info "TraderepublicItem #{traderepublic_item.id}: parsed class=#{parsed.class} keys=#{parsed.respond_to?(:keys) ? parsed.keys : "n/a"}"
-      Rails.logger.info "TraderepublicItem #{traderepublic_item.id}: parsed preview=#{parsed.inspect[0..300]}"
+      parsed = normalize_json(transactions_data) || {}
+      items = extract_items(parsed)
 
-      items = if parsed.is_a?(Hash)
-        parsed["items"]
-      elsif parsed.is_a?(Array)
+      if items.is_a?(Array) && items.any?
+        enrich_items_in_batches(items)
+        Rails.logger.info "TraderepublicItem #{traderepublic_item.id}: Snapshot has #{items.size} items"
+      end
+
+      account.upsert_traderepublic_transactions_snapshot!(parsed)
+    rescue JSON::ParserError => e
+      Rails.logger.error "TraderepublicItem #{traderepublic_item.id}: Failed to parse transactions - #{e.message}"
+    end
+
+    # Collect ISINs + txn ids up front and fetch them in two batched WebSocket
+    # sessions, then merge results back onto the items. Avoids opening N*2
+    # connections (one per enrichment call) for large imports.
+    def enrich_items_in_batches(items)
+      isins = items.map { |t| extract_isin(t) }.compact.uniq
+      txn_ids = items.map { |t| t["id"] }.compact.uniq
+
+      instrument_details = isins.any? ? provider.batch_fetch_instrument_details(isins) : {}
+
+      trade_details = {}
+      if txn_ids.any?
+        provider.batch_websocket_calls do |batch|
+          txn_ids.each { |id| trade_details[id] = batch.get_timeline_detail(id) }
+        end
+      end
+
+      items.each do |txn|
+        isin = extract_isin(txn)
+        txn["instrument_details"] = instrument_details[isin] if isin && instrument_details[isin]
+        txn["trade_details"] = trade_details[txn["id"]] if trade_details[txn["id"]]
+      end
+    end
+
+    def extract_items(parsed)
+      case parsed
+      when Hash then parsed["items"]
+      when Array
         pair = parsed.find { |p| p[0] == "items" }
         pair ? pair[1] : nil
       end
+    end
 
-      if items.is_a?(Array)
-        Rails.logger.info "TraderepublicItem #{traderepublic_item.id}: items count before enrichment = #{items.size}"
-        items.each do |txn|
-          isin = txn["isin"]
-          isin ||= txn.dig("instrument", "isin")
-          isin ||= extract_isin_from_icon(txn["icon"])
+    def extract_isin(txn)
+      isin = txn["isin"] || txn.dig("instrument", "isin") || extract_isin_from_icon(txn["icon"])
+      return nil unless isin.is_a?(String)
+      isin.match?(/^[A-Z]{2}[A-Z0-9]{10}$/) ? isin : nil
+    end
 
-          if isin.present? && isin.match?(/^[A-Z]{2}[A-Z0-9]{10}$/)
-            begin
-              instrument_details = provider.get_instrument_details(isin)
-              txn["instrument_details"] = instrument_details if instrument_details.present?
-            rescue => e
-              Rails.logger.warn "TraderepublicItem #{traderepublic_item.id}: Failed to fetch instrument details for ISIN #{isin} - #{e.message}"
-            end
-          end
+    def extract_isin_from_icon(icon)
+      return nil unless icon.is_a?(String)
+      match = icon.match(%r{logos/([A-Z]{2}[A-Z0-9]{9}\d)/})
+      match ? match[1] : nil
+    end
 
-          begin
-            trade_details = provider.get_timeline_detail(txn["id"])
-            txn["trade_details"] = trade_details if trade_details.present?
-          rescue => e
-            Rails.logger.warn "TraderepublicItem #{traderepublic_item.id}: Failed to fetch trade details for txn #{txn["id"]} - #{e.message}"
-          end
-        end
-        Rails.logger.info "TraderepublicItem #{traderepublic_item.id}: items count after enrichment = #{items.size}"
-      end
-
-      items_count = items.is_a?(Array) ? items.size : 0
-      preview = items.is_a?(Array) && items_count > 0 ? items.first(2).map { |i| i.slice("id", "title", "isin") } : items.inspect
-      Rails.logger.info "TraderepublicItem #{traderepublic_item.id}: Transactions snapshot contains #{items_count} items (with instrument details). Preview: #{preview}"
-
-      account.upsert_traderepublic_transactions_snapshot!(parsed)
-      Rails.logger.info "TraderepublicItem #{traderepublic_item.id}: Snapshot saved with #{items_count} items."
-
-      process_transactions(account, parsed)
-    rescue JSON::ParserError => e
-      Rails.logger.error "TraderepublicItem #{traderepublic_item.id}: Failed to parse transactions - #{e.message}"
-    rescue => e
-      Rails.logger.error "TraderepublicItem #{traderepublic_item.id}: Unexpected error in import_transactions - #{e.class}: #{e.message}"
-      Rails.logger.error e.backtrace.join("\n") if e.respond_to?(:backtrace)
-      raise
+    def normalize_json(value)
+      return nil if value.nil?
+      value.is_a?(String) ? JSON.parse(value) : value
     end
 
     def find_or_create_main_account(portfolio_data)
-      # TradeRepublic typically has one main account
       account = traderepublic_item.traderepublic_accounts.first_or_initialize(
         account_id: "main",
         name: "Trade Republic",
@@ -171,7 +148,6 @@ class TraderepublicItem::Importer
     end
 
     def update_account_with_portfolio(account, portfolio_data, cash_data = nil)
-      # Extract cash/balance from portfolio if available
       cash_value = extract_cash_value(portfolio_data, cash_data)
 
       account.upsert_traderepublic_snapshot!({
@@ -186,17 +162,12 @@ class TraderepublicItem::Importer
     end
 
     def extract_cash_value(portfolio_data, cash_data = nil)
-      # Try to extract cash value from cash_data first
       if cash_data.is_a?(Array) && cash_data.first.is_a?(Hash)
-        # [{"accountNumber"=>"...", "currencyId"=>"EUR", "amount"=>1064.3}]
         return cash_data.first["amount"]
       end
 
-      # Try to extract cash value from portfolio structure
-      # This depends on the actual API response structure
       return 0 unless portfolio_data.is_a?(Hash)
 
-      # Common patterns in trading APIs
       portfolio_data.dig("cash", "value") ||
         portfolio_data.dig("availableCash") ||
         portfolio_data.dig("balance") ||
@@ -207,15 +178,14 @@ class TraderepublicItem::Importer
       positions = extract_positions(portfolio_data)
       return if positions.empty?
 
-      Rails.logger.info "TraderepublicItem #{traderepublic_item.id}: Processing #{positions.size} positions"
-
       linked_account = account.linked_account
       return unless linked_account
 
       positions.each do |position|
         security = find_or_create_security_from_tr(position)
-        holding_date = position["date"] || Date.current # fallback to today if nil
-        next unless holding_date.present?
+        holding_date = position["date"] || Date.current
+        next unless holding_date && security
+
         holding = Holding.find_or_initialize_by(
           account: linked_account,
           security: security,
@@ -231,52 +201,7 @@ class TraderepublicItem::Importer
     def extract_positions(portfolio_data)
       return [] unless portfolio_data.is_a?(Hash)
 
-      # Extract positions based on the Portfolio interface structure
       categories = portfolio_data["categories"] || []
-
-      positions = []
-      categories.each do |category|
-        next unless category["positions"].is_a?(Array)
-
-        category["positions"].each do |position|
-          positions << position
-        end
-      end
-
-      positions
-    end
-
-    def extract_isin_from_icon(icon)
-      return nil unless icon.is_a?(String)
-      match = icon.match(%r{logos/([A-Z]{2}[A-Z0-9]{9}\d)/})
-      match ? match[1] : nil
-    end
-
-    def process_transactions(account, transactions_data)
-      return unless transactions_data.is_a?(Array)
-
-      Rails.logger.info "TraderepublicItem #{traderepublic_item.id}: Processing #{transactions_data.size} transactions"
-
-      linked_account = account.linked_account
-      return unless linked_account
-
-      trades = []
-      transactions_data.each do |txn|
-        security = find_or_create_security_from_tr(txn)
-        trade = Trade.create!(
-          account: linked_account,
-          security: security,
-          qty: txn["quantity"],
-          price: txn["price"],
-          date: txn["date"],
-          currency: txn["currency"]
-        )
-        if block_given?
-          yield trade
-        else
-          trades << trade
-        end
-      end
-      trades unless block_given?
+      categories.flat_map { |category| Array(category["positions"]) }
     end
 end

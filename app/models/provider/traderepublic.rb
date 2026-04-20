@@ -2,8 +2,8 @@ require "websocket-client-simple"
 require "json"
 
 class Provider::Traderepublic
-  # Batch fetch instrument details for a list of ISINs
-  # Returns a hash { isin => instrument_details }
+  # Batch fetch instrument details for a list of ISINs.
+  # Returns a hash { isin => instrument_details }.
   def batch_fetch_instrument_details(isins)
     results = {}
     batch_websocket_calls do |batch|
@@ -13,7 +13,8 @@ class Provider::Traderepublic
     end
     results
   end
-  # Helper: Get portfolio, cash et available_cash en un seul batch WebSocket
+
+  # Fetch portfolio + cash + available_cash in a single WebSocket session.
   def get_portfolio_and_cash_batch
     results = {}
     batch_websocket_calls do |batch|
@@ -23,19 +24,18 @@ class Provider::Traderepublic
     end
     results
   end
-  # Execute several subscribe_once calls in a single WebSocket session
+
+  # Execute several subscribe_once calls in a single WebSocket session.
   # Usage: batch_websocket_calls { |batch| batch.get_portfolio; batch.get_cash }
   def batch_websocket_calls
     connect_websocket
-    batch_proxy = BatchWebSocketProxy.new(self)
-    yield batch_proxy
-    # Optionally, small sleep to allow last messages to arrive
-    sleep 0.5
+    yield BatchWebSocketProxy.new(self)
+    sleep 0.5 # allow trailing messages to arrive before teardown
   ensure
     disconnect_websocket
   end
 
-  # Proxy to expose only subscribe_once helpers on an open connection
+  # Proxy exposing subscribe_once helpers on an already-open connection.
   class BatchWebSocketProxy
     def initialize(provider)
       @provider = provider
@@ -60,8 +60,6 @@ class Provider::Traderepublic
     def get_instrument_details(isin)
       @provider.subscribe_once("instrument", { id: isin })
     end
-
-    # Ajoutez ici d'autres helpers si besoin
   end
   include HTTParty
 
@@ -79,7 +77,7 @@ class Provider::Traderepublic
   attr_reader :phone_number, :pin
   attr_accessor :session_token, :refresh_token, :raw_cookies, :process_id, :jsessionid
 
-  def initialize(phone_number:, pin:, session_token: nil, refresh_token: nil, raw_cookies: nil)
+  def initialize(phone_number: nil, pin: nil, session_token: nil, refresh_token: nil, raw_cookies: nil)
     @phone_number = phone_number
     @pin = pin
     @session_token = session_token
@@ -252,11 +250,16 @@ class Provider::Traderepublic
     false
   end
 
-  # WebSocket operations
+  # WARNING: websocket-client-simple does not verify the TLS certificate of the
+  # remote host by default, which leaves session tokens exposed to an active
+  # MITM on the WS leg. Callers should be aware that this client is unsuitable
+  # for untrusted networks. See provider docs for the tracked workaround.
   def connect_websocket
     raise "Already connected" if @ws && @ws.open?
 
-    # Store reference to self for use in closures
+    Rails.logger.warn "TradeRepublic: opening WebSocket without TLS peer verification (websocket-client-simple limitation)" unless @tls_warning_emitted
+    @tls_warning_emitted = true
+
     provider = self
 
     @ws = WebSocket::Client::Simple.connect(WS_HOST) do |ws|
@@ -487,7 +490,7 @@ class Provider::Traderepublic
     isins = all_items.map { |item| item["isin"] }.compact.uniq
     instrument_details = batch_fetch_instrument_details(isins) unless isins.empty?
 
-    # Ajoute les détails instrument à chaque transaction
+    # Attach instrument details to each transaction
     if instrument_details
       all_items.each do |item|
         isin = item["isin"]

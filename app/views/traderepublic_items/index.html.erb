@@ -4,7 +4,7 @@
       <h2 class="text-2xl font-semibold text-primary"><%= t(".title", default: "Trade Republic Connections") %></h2>
       <p class="text-secondary mt-1"><%= t(".description", default: "Manage your Trade Republic broker connections") %></p>
     </div>
-    <%= link_to new_traderepublic_item_path, 
+    <%= link_to new_traderepublic_item_path,
                 class: "btn btn-primary",
                 data: { turbo_frame: "modal" } do %>
       <%= icon "plus", class: "w-4 h-4 mr-2" %>
@@ -37,7 +37,7 @@
                   </span>
                 <% end %>
               </div>
-              
+
               <div class="mt-2 space-y-1 text-sm text-secondary">
                 <p>
                   <%= icon "phone", class: "w-4 h-4 inline mr-1" %>

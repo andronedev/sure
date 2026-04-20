@@ -4,7 +4,7 @@ class TraderepublicItemsController < ApplicationController
   def new
     @traderepublic_item = TraderepublicItem.new(family: Current.family)
     @accountable_type = params[:accountable_type]
-    @return_to = params[:return_to]
+    @return_to = safe_return_to_path
   end
 
   def index
@@ -14,7 +14,7 @@ class TraderepublicItemsController < ApplicationController
   def create
     @traderepublic_item = TraderepublicItem.new(traderepublic_item_params.merge(family: Current.family))
     @accountable_type = params[:accountable_type]
-    @return_to = params[:return_to]
+    @return_to = safe_return_to_path
 
     if @traderepublic_item.save
       begin
@@ -55,7 +55,7 @@ class TraderepublicItemsController < ApplicationController
     end
   end
 
-  # Manual sync: déclenche le flow PIN (initiate_login) puis popup PIN
+  # Manual sync: triggers the PIN flow (initiate_login) then the PIN modal
   def manual_sync
     begin
       result = @traderepublic_item.initiate_login!
@@ -102,11 +102,11 @@ class TraderepublicItemsController < ApplicationController
       success = @traderepublic_item.complete_login!(device_pin)
       if success
         if manual_sync
-          # Manual sync: fetch only new tranwsactions since last transaction for each account
+          # Manual sync: fetch only transactions newer than the last stored one per account
           @traderepublic_item.traderepublic_accounts.each do |tr_account|
             last_date = tr_account.last_transaction_date
             provider = @traderepublic_item.traderepublic_provider
-            # fetch new transactions (depuis la dernière date + 1 jour pour éviter doublons)
+            # Fetch new transactions from (last_date + 1 day) to avoid duplicates
             since = last_date ? last_date + 1.day : nil
             new_snapshot = provider.get_timeline_transactions(since: since)
             tr_account.upsert_traderepublic_transactions_snapshot!(new_snapshot)
@@ -153,10 +153,10 @@ class TraderepublicItemsController < ApplicationController
         render json: { success: false, error: t(".verification_failed", default: "PIN verification failed") }, status: :unprocessable_entity
       end
     rescue TraderepublicError => e
-      Rails.logger.error "TradeRepublic PIN verification failed: \\#{e.message}"
+      Rails.logger.error "TradeRepublic PIN verification failed: #{e.message}"
       render json: { success: false, error: e.message }, status: :unprocessable_entity
     rescue => e
-      Rails.logger.error "Unexpected error during PIN verification: \\#{e.class}: \\#{e.message}"
+      Rails.logger.error "Unexpected error during PIN verification: #{e.class}: #{e.message}"
       render json: { success: false, error: t(".unexpected_error", default: "An unexpected error occurred") }, status: :internal_server_error
     end
   end
